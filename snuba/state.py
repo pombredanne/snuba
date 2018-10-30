@@ -38,6 +38,9 @@ ratelimit_prefix = 'snuba-ratelimit:'
 query_lock_prefix = 'snuba-query-lock:'
 query_cache_prefix = 'snuba-query-cache:'
 config_hash = 'snuba-config'
+config_history_hash = 'snuba-config-history'
+config_changes_list = 'snuba-config-changes'
+config_changes_list_limit = 25
 queries_list = 'snuba-queries'
 
 # Rate Limiting and Deduplication
@@ -218,14 +221,28 @@ def abtest(value):
 
 
 def set_config(key, value):
-    if value is None:
-        delete_config(key)
-    else:
-        try:
+    if value is not None:
+        value = u'{}'.format(value).encode('utf-8')
+
+    try:
+        original_value = rds.hget(config_hash, key)
+        if original_value is not None:
+            original_value = original_value.decode('utf-8')
+
+        if value == original_value:
+            return
+
+        change_record = (time.time(), original_value, value)
+        if value is None:
+            rds.hdel(config_hash, key)
+            rds.hdel(config_history_hash, key)
+        else:
             rds.hset(config_hash, key, value)
-        except Exception as ex:
-            logger.error(ex)
-            pass
+            rds.hset(config_history_hash, key, json.dumps(change_record))
+        rds.lpush(config_changes_list, json.dumps((key,) + change_record))
+        rds.ltrim(config_changes_list, 0, config_changes_list_limit)
+    except Exception as ex:
+        logger.error(ex)
 
 
 def set_configs(values):
@@ -256,12 +273,13 @@ def get_raw_configs():
         return {}
 
 
+def annotate_raw_configs(configs):
+    changes = {k.decode('utf-8'): v for k, v in six.iteritems(rds.hgetall(config_hash_history))}
+    return {k: (v, changes.get(k, v)) for k, v in six.iteritems(configs)}
+
+
 def delete_config(key):
-    try:
-        rds.hdel(config_hash, key)
-    except Exception as ex:
-        logger.error(ex)
-        pass
+    return set_config(key, None)
 
 
 # Query Recording
