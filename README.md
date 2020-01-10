@@ -2,82 +2,49 @@
 
 A service providing fast event searching, filtering and aggregation on arbitrary fields.
 
-## Requirements
+## Sentry + Snuba
+
+Add/change the following lines in `~/.sentry/sentry.conf.py`:
+
+    SENTRY_SEARCH = 'sentry.search.snuba.EventsDatasetSnubaSearchBackend'
+    SENTRY_TSDB = 'sentry.tsdb.redissnuba.RedisSnubaTSDB'
+    SENTRY_EVENTSTREAM = 'sentry.eventstream.snuba.SnubaEventStream'
+
+Run:
+
+    sentry devservices up
+
+Access raw clickhouse client (similar to psql):
+
+    docker exec -it sentry_clickhouse clickhouse-client
+
+Data is written into the table `sentry_local`: `select count() from sentry_local;`
+
+## Requirements (Only required if you are developing against Snuba)
 
 Snuba assumes:
 
-1. A Clickhouse server endpoint at `CLICKHOUSE_SERVER` (default `localhost:9000`).
+1. A Clickhouse server endpoint at `CLICKHOUSE_HOST` (default `localhost`).
 2. A redis instance running at `REDIS_HOST` (default `localhost`). On port
    `6379`
 
-## Install / Run
+A quick way to get these services running is to set up sentry, then use:
 
-    mkvirtualenv snuba
+    sentry devservices up --exclude=snuba
+
+## Install / Run (Only required if you are developing against Snuba)
+
+    mkvirtualenv snuba --python=python3.7
     workon snuba
+    make install-python-dependencies
+    make install-librdkafka
 
     # Run API server
     snuba api
 
-## Sentry + Snuba
-
-Add the following line to `sentry.conf.py`:
-
-    SENTRY_EVENTSTREAM = 'sentry.eventstream.snuba.SnubaEventStream'
-
-Create a docker volume for Clickhouse:
-
-    `docker volume create clickhouse`
-
-Run the clickhouse server:
-
-    docker run -d -p 9000:9000 -p 9009:9009 -p 8123:8123 --name=clickhouse -v clickhouse:/var/lib/clickhouse --ulimit nofile=262144:262144 yandex/clickhouse-server:18.14.9
-
-This can be managed with `docker stop clickhouse` and `docker start clickhouse` to stop/start the service.
-
-Prepare Snuba environment
-
-    git clone git@github.com:getsentry/snuba.git
-    mkvirtualenv snuba
-    pip install -e .
-
-Run Snuba
-
-    snuba api
-
-Access raw clickhouse client (similar to psql):
-
-    docker run --rm --net=host -it yandex/clickhouse-client
-
-Data is written into the table `dev`: `select count() from dev;`
-
-
-### Using docker-compose
-
-Snuba and its related services can be run via `docker-compose` which is a good
-option if you need a quick way to get snuba up and running to passively run it
-or to run sentry's test suites.
-
-To start the containers run
-
-    docker-compose up
-
-You can background the containers by adding the `-d` option to `up`. Your
-checkout will be mounted into the container allowing you to interactively work
-with any changes you make.
-
-You will need to rebuild the `snuba-api` image if you change any application
-dependencies.
-
-To run sentry's test suite against snuba, uncomment `SNUBA_SETTINGS: test` in
-the `docker-compose.yml` and restart your `snuba-api` container with:
-
-    docker-compose kill snuba-api
-    docker-compose rm snuba-api
-    docker-compose up snuba-api
-
 ## API
 
-Snuba exposes an HTTP API with the following endpoints.
+Snuba exposes an HTTP API (default port: `1218`) with the following endpoints.
 
 - [/](/): Shows this page.
 - [/dashboard](/dashboard): Query dashboard
@@ -88,21 +55,38 @@ Snuba exposes an HTTP API with the following endpoints.
 
 Settings are found in `settings.py`
 
-- `CLICKHOUSE_SERVER` : The endpoint for the clickhouse service.
-- `CLICKHOUSE_TABLE` : The clickhouse table name.
+- `CLICKHOUSE_HOST` : The hostname for the clickhouse service.
 - `REDIS_HOST` : The host redis is running on.
+- `DATASET_MODE` : If "local" runs Clickhouse local tables instead of distributed ones.
 
 ## Tests
 
-    docker run -d -p 9000:9000 -p 9009:9009 -p 8123:8123 \
-      --name clickhouse-server --ulimit nofile=262144:262144 yandex/clickhouse-server
-
     pip install -e .
-
-    # If you're using docker-machine get the VM's IP
-    export CLICKHOUSE_SERVER=$(docker-machine ip):9000
-
     make test
+
+## Testing Against Sentry
+
+```
+workon snuba
+git checkout your-snuba-branch
+snuba api
+```
+And then in another terminal
+```
+workon sentry
+git checkout master
+git pull
+sentry devservices up --exclude=snuba
+```
+This will get the most recent version of Sentry on master, and bring up all snuba's dependencies.
+
+You will want to run the following Sentry tests:
+```
+USE_SNUBA=1 make test-acceptance
+USE_SNUBA=1 make test-snuba
+make test-python
+```
+Note that python tests do not currently pass with the `USE_SNUBA` flag, but should be fixed in the future. For now, simply run it without `USE_SNUBA` flag (which determines the version of TagStore). Note also that we check for the existance of `USE_SNUBA` rather than take into account the value. `USE_SNUBA=0` does not currently work as intended.
 
 ## Querying
 
@@ -125,7 +109,7 @@ An example query body might look like:
         "from_date": "2011-07-01T19:54:15",
         "to_date": "2018-07-06T19:54:15"
         "granularity": 3600,
-        "groupby": ["issue", "time"],
+        "groupby": ["group_id", "time"],
         "having": [],
         "issues": [],
     }
@@ -155,7 +139,7 @@ which is transformed into the SQL:
 Some aggregation function are generated by other functions, eg topK. so an
 example query would send:
 
-    ["topK(5)", "environment", "top_five_envs"]
+    ["top5", "environment", "top_five_envs"]
 
 To produce the SQL:
 
@@ -320,16 +304,16 @@ Queries with sampling are stable. Ie the same query with the same sampling
 factor over the same data should consistently return the exact same result.
 
 
-### Issues / Groups
+### Groups / Issues
 
-Snuba provides a magic column `issue` that can be used to group events by issue.
+Snuba provides a magic column `group_id` that can be used to group events by issue.
 
 Because events can be reassigned to different issues through merging, and
 because snuba does not support updates, we cannot store the issue id for an
-event in snuba. If you want to filter or group by `issue`, you need to pass a
-list of `issues` into the query.  This list is a mapping from issue ids to the
+event in snuba. If you want to filter or group by `group_id`, you need to pass a
+list of `group_ids` into the query.  This list is a mapping from issue ids to the
 event `primary_hash`es in that issue. Snuba automatically expands this mapping
-into the query so that filters/grouping on `issue` will just work.
+into the query so that filters/grouping on `group_id` will just work.
 
 ### Tags
 
@@ -375,7 +359,7 @@ column.
 
     # Find the top 5 most often used tags
     "aggregations": [
-        ["topK(5)", "tags_key", "top_tag_keys"],
+        ["top5", "tags_key", "top_tag_keys"],
     ],
 <!-- -->
 
